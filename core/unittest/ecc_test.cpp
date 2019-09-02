@@ -2099,10 +2099,12 @@ void TestTreasury()
 
 void TestLelantus()
 {
-	printf("Lelantus [n, M, N] = [%u, %u, %u]\n", beam::Lelantus::Cfg::n, beam::Lelantus::Cfg::M, beam::Lelantus::Cfg::N);
+	beam::Lelantus::Cfg cfg; // default
+	const uint32_t N = cfg.get_N();
+	printf("Lelantus [n, M, N] = [%u, %u, %u]\n", cfg.n, cfg.M, N);
 
 	beam::Lelantus::CmListVec lst;
-	lst.m_vec.resize(beam::Lelantus::Cfg::N);
+	lst.m_vec.resize(N);
 
 	Point::Native rnd;
 	SetRandom(rnd);
@@ -2112,8 +2114,7 @@ void TestLelantus()
 
 	beam::Lelantus::Proof proof;
 	beam::Lelantus::Proof::Output outp;
-	std::unique_ptr<beam::Lelantus::Prover> pProver(std::make_unique<beam::Lelantus::Prover>(lst, proof));
-	beam::Lelantus::Prover& p = *pProver;
+	beam::Lelantus::Prover p(lst, proof);
 
 	p.m_Witness.V.m_V = 100500;
 	p.m_Witness.V.m_R = 4U;
@@ -2166,8 +2167,6 @@ void TestLelantus()
 		verify_test(krn.IsValid(g_hFork, fee, pt));
 	}
 
-	//const uint32_t N = Lelantus::Cfg::N;
-
 	Oracle oracle;
 
 	uint32_t t = beam::GetTime_ms();
@@ -2183,7 +2182,8 @@ void TestLelantus()
 		beam::Serializer ser_;
 		ser_ & proof;
 
-		memset(&proof, 0xff, sizeof(proof));
+		proof.m_Part1.m_vGQ.clear();
+		proof.m_Part2.m_vF.clear();
 
 		beam::Deserializer der_;
 		der_.reset(ser_.buffer().first, ser_.buffer().second);
@@ -2194,7 +2194,7 @@ void TestLelantus()
 	MyBatch bc;
 
 	std::vector<ECC::Scalar::Native> vKs;
-	vKs.resize(beam::Lelantus::Cfg::N);
+	vKs.resize(N);
 
 	bool bSuccess = true;
 
@@ -2213,7 +2213,7 @@ void TestLelantus()
 				bSuccess = false;
 		}
 
-		lst.Calculate(bc.m_Sum, 0, beam::Lelantus::Cfg::N, &vKs.front());
+		lst.Calculate(bc.m_Sum, 0, N, &vKs.front());
 
 		if (!bc.Flush())
 			bSuccess = false;

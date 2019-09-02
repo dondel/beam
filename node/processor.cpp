@@ -65,16 +65,6 @@ void NodeProcessor::Initialize(const char* szPath, const StartParams& sp)
 	m_Extra.m_TxoHi = m_DB.ParamIntGetDef(NodeDB::ParamID::HeightTxoHi, Rules::HeightGenesis - 1);
 	m_Extra.m_Shielded = m_DB.ParamIntGetDef(NodeDB::ParamID::ShieldedPoolSize);
 
-	if (m_Extra.m_Shielded < Lelantus::Cfg::N)
-	{
-		if (m_Extra.m_Shielded)
-			OnCorrupted();
-
-		// implicit initial commitments
-		m_Extra.m_Shielded = Lelantus::Cfg::N;
-		m_DB.ShieldedResize(m_Extra.m_Shielded);
-	}
-
 	bool bUpdateChecksum = !m_DB.ParamGet(NodeDB::ParamID::CfgChecksum, NULL, &blob);
 	if (!bUpdateChecksum)
 	{
@@ -189,16 +179,25 @@ int My_strcmpi(const char* sz1, const char* sz2)
 	return 0;
 }
 
-bool NodeProcessor::InitUtxoMapping(const char* sz)
+void NodeProcessor::get_UtxoMappingPath(std::string& sPath, const char* sz)
 {
 	// derive UTXO path from db path
-	std::string sPath(sz);
+	sPath = sz;
 
 	static const char szSufix[] = ".db";
 	const size_t nSufix = _countof(szSufix) - 1;
 
 	if ((sPath.size() >= nSufix) && !My_strcmpi(sPath.c_str() + sPath.size() - nSufix, szSufix))
 		sPath.resize(sPath.size() - nSufix);
+
+	sPath += "-utxo-image.bin";
+}
+
+bool NodeProcessor::InitUtxoMapping(const char* sz)
+{
+	// derive UTXO path from db path
+	std::string sPath;
+	get_UtxoMappingPath(sPath, sz);
 
 	UtxoTreeMapped::Stamp us;
 	Blob blob(us);
@@ -210,7 +209,6 @@ bool NodeProcessor::InitUtxoMapping(const char* sz)
 		us.Negate();
 	}
 
-	sPath += "-utxo-image.bin";
 	return m_Utxos.Open(sPath.c_str(), us);
 }
 
@@ -617,7 +615,7 @@ void NodeProcessor::RequestDataInternal(const Block::SystemState::ID& id, uint64
 
 struct NodeProcessor::MultiShieldedContext
 {
-	static const uint32_t s_Chunk = Lelantus::Cfg::N / 4;
+	static const uint32_t s_Chunk = 0x400;
 
 	struct Node
 	{
@@ -640,7 +638,7 @@ struct NodeProcessor::MultiShieldedContext
 	std::mutex m_Mutex;
 	Node::IDSet m_Set;
 
-	void Add(TxoID, const ECC::Scalar::Native*);
+	void Add(TxoID id0, uint32_t nCount, const ECC::Scalar::Native*);
 	void ClearLocked();
 
 	~MultiShieldedContext()
@@ -674,9 +672,8 @@ void NodeProcessor::MultiShieldedContext::DeleteRaw(Node& n)
 	delete &n;
 }
 
-void NodeProcessor::MultiShieldedContext::Add(TxoID id0, const ECC::Scalar::Native* pS)
+void NodeProcessor::MultiShieldedContext::Add(TxoID id0, uint32_t nCount, const ECC::Scalar::Native* pS)
 {
-	uint32_t nCount = Lelantus::Cfg::N;
 	uint32_t nOffset = static_cast<uint32_t>(id0 % s_Chunk);
 
 	Node::ID key;
@@ -790,14 +787,23 @@ bool NodeProcessor::MultiShieldedContext::IsValid(const Input& v, std::vector<EC
 	if (!outp.m_Pt.Import(outp.m_Commitment))
 		return false;
 
-	vKs.resize(Lelantus::Cfg::N);
-	memset0(&vKs.front(), sizeof(ECC::Scalar::Native) * beam::Lelantus::Cfg::N);
+	uint32_t N = v.m_pSpendProof->m_Cfg.get_N();
+	if (!N)
+		return false;
+
+	vKs.resize(N);
+	memset0(&vKs.front(), sizeof(ECC::Scalar::Native) * N);
 
 	ECC::Oracle oracle;
 	if (!v.m_pSpendProof->IsValid(bc, oracle, outp, &vKs.front()))
 		return false;
 
-	Add(v.m_pSpendProof->m_Window0, &vKs.front());
+	TxoID id1 = v.m_pSpendProof->m_WindowEnd;
+	if (id1 >= N)
+		Add(id1 - N, N, &vKs.front());
+	else
+		Add(0, static_cast<uint32_t>(id1), &vKs.front() + N - static_cast<uint32_t>(id1));
+
 	return true;
 }
 
@@ -1797,9 +1803,13 @@ bool NodeProcessor::HandleBlock(const NodeDB::StateID& sid, MultiblockContext& m
 		}
 	}
 
+	TxoID id0 = m_Extra.m_Txos;
+
 	bool bOk = HandleValidatedBlock(block.get_Reader(), block, sid.m_Height, true);
 	if (!bOk)
 		LOG_WARNING() << LogSid(m_DB, sid) << " invalid in its context";
+
+	assert(m_Extra.m_Txos > id0);
 
 	if (bFirstTime && bOk)
 	{
@@ -1937,14 +1947,12 @@ bool NodeProcessor::HandleBlock(const NodeDB::StateID& sid, MultiblockContext& m
 				m_DB.TxoSetSpent(x.m_ID, sid.m_Height);
 		}
 
-		assert(m_Extra.m_Txos > block.m_vOutputs.size());
-		TxoID id0 = m_Extra.m_Txos - block.m_vOutputs.size() - 1;
 
 		Serializer ser;
 		bbP.clear();
 		ser.swap_buf(bbP);
 
-		for (size_t i = 0; i < block.m_vOutputs.size(); i++, id0++)
+		for (size_t i = 0; i < block.m_vOutputs.size(); i++)
 		{
 			const Output& x = *block.m_vOutputs[i];
 			if (x.m_pDoubleBlind)
@@ -1954,7 +1962,7 @@ bool NodeProcessor::HandleBlock(const NodeDB::StateID& sid, MultiblockContext& m
 			ser & x;
 
 			SerializeBuffer sb = ser.buffer();
-			m_DB.TxoAdd(id0, Blob(sb.first, static_cast<uint32_t>(sb.second)));
+			m_DB.TxoAdd(id0++, Blob(sb.first, static_cast<uint32_t>(sb.second)));
 		}
 
 		auto r = block.get_Reader();
@@ -2184,8 +2192,6 @@ bool NodeProcessor::HandleValidatedBlock(TxBase::IReader&& r, const Block::BodyB
 
 bool NodeProcessor::HandleBlockElement(const Input& v, Height h, const Height* pHMax, bool bFwd)
 {
-	m_Utxos.EnsureReserve();
-
 	if (v.m_pSpendProof)
 	{
 		if (bFwd && !IsShieldedInPool(v))
@@ -2263,6 +2269,8 @@ bool NodeProcessor::HandleBlockElement(const Input& v, Height h, const Height* p
 		UtxoTree::Key key;
 		key = d;
 
+		m_Utxos.EnsureReserve();
+
 		p = m_Utxos.Find(cu, key, bCreate);
 
 		if (bCreate)
@@ -2280,8 +2288,6 @@ bool NodeProcessor::HandleBlockElement(const Input& v, Height h, const Height* p
 
 bool NodeProcessor::HandleBlockElement(const Output& v, Height h, const Height* pHMax, bool bFwd)
 {
-	m_Utxos.EnsureReserve();
-
 	if (v.m_pDoubleBlind)
 		return HandleShieldedElement(v.m_Commitment, true, bFwd);
 
@@ -2299,6 +2305,8 @@ bool NodeProcessor::HandleBlockElement(const Output& v, Height h, const Height* 
 
 	UtxoTree::Key key;
 	key = d;
+
+	m_Utxos.EnsureReserve();
 
 	UtxoTree::Cursor cu;
 	bool bCreate = true;
@@ -2354,13 +2362,18 @@ bool NodeProcessor::IsShieldedInPool(const Transaction& tx)
 bool NodeProcessor::IsShieldedInPool(const Input& v)
 {
 	assert(v.m_pSpendProof);
-	return (v.m_pSpendProof->m_Window0 + Lelantus::Cfg::N <= m_Extra.m_Shielded);
+
+	// TODO: check cfg and referenced window vs current position
+
+	return (v.m_pSpendProof->m_WindowEnd <= m_Extra.m_Shielded);
 }
 
 bool NodeProcessor::HandleShieldedElement(const ECC::Point& comm, bool bOutp, bool bFwd)
 {
 	UtxoTree::Key key;
 	key.SetShielded(comm, bOutp);
+
+	m_Utxos.EnsureReserve();
 
 	UtxoTree::Cursor cu;
 	bool bCreate = true;
@@ -3811,6 +3824,53 @@ void NodeProcessor::InitializeUtxos()
 
 	Walker wlk(*this);
 	EnumTxos(wlk);
+
+	// shielded items
+	Height h0 = Rules::get().pForks[2].m_Height;
+	if (m_Cursor.m_Sid.m_Height >= h0)
+	{
+		ByteBuffer bbE;
+		TxVectors::Perishable txvp;
+
+		TxoID nShielded = m_Extra.m_Shielded;
+		m_Extra.m_Shielded = 0;
+
+		while (true)
+		{
+			ECC::Scalar offs;
+			m_DB.get_StateExtra(FindActiveAtStrict(h0), offs, &bbE);
+
+			if (!bbE.empty())
+			{
+				txvp.m_vInputs.clear();
+				txvp.m_vOutputs.clear();
+
+				Deserializer der;
+				der.reset(bbE);
+				der & txvp;
+
+				for (size_t i = 0; i < txvp.m_vInputs.size(); i++)
+				{
+					const Input& v = *txvp.m_vInputs[i];
+					assert(v.m_pSpendProof);
+					HandleShieldedElement(v.m_pSpendProof->m_Part1.m_SpendPk, false, true);
+				}
+
+				for (size_t i = 0; i < txvp.m_vOutputs.size(); i++)
+				{
+					const Output& v = *txvp.m_vOutputs[i];
+					assert(v.m_pDoubleBlind);
+					HandleShieldedElement(v.m_Commitment, true, true);
+				}
+			}
+
+			if (++h0 > m_Cursor.m_Sid.m_Height)
+				break;
+		}
+
+		if (m_Extra.m_Shielded != nShielded)
+			OnCorrupted();
+	}
 }
 
 bool NodeProcessor::GetBlock(const NodeDB::StateID& sid, ByteBuffer* pEthernal, ByteBuffer* pPerishable, Height h0, Height hLo1, Height hHi1)

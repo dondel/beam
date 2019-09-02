@@ -149,6 +149,11 @@ namespace beam
 		ECC::Hash::Value Prehistoric; // Prev hash of the 1st block
 		ECC::Hash::Value TreasuryChecksum;
 
+		struct {
+			bool Enabled = true; // past Fork2
+			// TODO - policy w.r.t. supported cfgs
+		} Shielded;
+
 		void UpdateChecksum();
 
 		static Amount get_Emission(Height);
@@ -240,7 +245,7 @@ namespace beam
 		struct SpendProof
 			:public Lelantus::Proof
 		{
-			TxoID m_Window0;
+			TxoID m_WindowEnd; // ID of the 1st element outside the window
 
 			int cmp(const SpendProof&) const;
 			COMPARISON_VIA_CMP

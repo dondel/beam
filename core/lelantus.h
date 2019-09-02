@@ -43,9 +43,18 @@ namespace Lelantus {
 	struct Cfg
 	{
 		// bitness selection
-		static const uint32_t n = 4;
-		static const uint32_t M = 5;
-		static const uint32_t N = Power<M>::Of<n>::V; // n^M
+		uint32_t n = 4;
+		uint32_t M = 5;
+
+		struct Max {
+			static const uint32_t n = 128; // typically it's 2 or 4
+			static const uint32_t M = 31;
+			static const uint32_t nM = ECC::InnerProduct::nDim * 2 - 1; // otherwise we won't have enough generators
+			static const uint32_t N = 0x100000; // 1mln. Typically it's VERY MUCH smaller.
+		};
+
+		uint32_t get_N() const; // n^M is parameters are sane, 0 otherwise
+		uint32_t get_F() const; // M * (n - 1)
 	};
 
 	namespace SpendKey {
@@ -54,6 +63,8 @@ namespace Lelantus {
 
 	struct Proof
 	{
+		Cfg m_Cfg;
+
 		struct Output
 		{
 			// not a part of the proof, a by-product
@@ -65,9 +76,14 @@ namespace Lelantus {
 		{
 			ECC::Point m_SpendPk;
 			ECC::Point m_A, m_B, m_C, m_D;
-			ECC::Point m_pG[Cfg::M];
-			ECC::Point m_pQ[Cfg::M];
 			ECC::Point m_NonceG; // consists of G only. Used to sign both balance and spend proofs.
+
+			struct GQ {
+				ECC::Point m_G;
+				ECC::Point m_Q;
+			};
+
+			std::vector<GQ> m_vGQ;
 
 			void Expose(ECC::Oracle& oracle) const;
 
@@ -76,7 +92,7 @@ namespace Lelantus {
 		struct Part2
 		{
 			ECC::Scalar m_zA, m_zC, m_zV, m_zR;
-			ECC::Scalar m_pF[Cfg::M][Cfg::n - 1];
+			std::vector<ECC::Scalar> m_vF;
 			ECC::Scalar m_ProofG; // Both balance and spend proofs
 
 		} m_Part2;
@@ -88,17 +104,30 @@ namespace Lelantus {
 	{
 		CmList& m_List;
 
+		std::unique_ptr<ECC::Scalar::Native[]> m_vBuf; // all the needed data as one array
+
+		struct Idx
+		{
+			static const uint32_t rA = 0;
+			static const uint32_t rB = 1;
+			static const uint32_t rC = 2;
+			static const uint32_t rD = 3;
+			static const uint32_t rBalance = 4;
+			static const uint32_t Serial = 5;
+
+			static const uint32_t CountFixed = 6;
+
+			// 
+		};
+
 		// nonces
-		ECC::Scalar::Native m_rA, m_rB, m_rC, m_rD;
-		ECC::Scalar::Native m_a[Cfg::M][Cfg::n];
-		ECC::Scalar::Native m_Gamma[Cfg::M];
-		ECC::Scalar::Native m_Ro[Cfg::M];
-		ECC::Scalar::Native m_Tau[Cfg::M];
-		ECC::Scalar::Native m_rBalance;
-		ECC::Scalar::Native m_Serial;
+		ECC::Scalar::Native* m_a;
+		ECC::Scalar::Native* m_Gamma;
+		ECC::Scalar::Native* m_Ro;
+		ECC::Scalar::Native* m_Tau;
 
 		// precalculated coeffs
-		ECC::Scalar::Native m_p[Cfg::M][Cfg::N]; // very large
+		ECC::Scalar::Native* m_p;
 
 		void InitNonces(const ECC::uintBig& seed);
 		void CalculateP();
