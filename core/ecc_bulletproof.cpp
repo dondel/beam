@@ -129,6 +129,20 @@ namespace ECC {
 			Oracle() << m_Multiplier >> m_Multiplier;
 	}
 
+	void InnerProduct::Modifier::Channel::SetPwr(const Scalar::Native& x)
+	{
+		m_pV[0] = 1U;
+		for (uint32_t i = 1; i < nDim; i++)
+			m_pV[i] = m_pV[i - 1] * x;
+	}
+
+	void InnerProduct::Modifier::Set(Scalar::Native& dst, const Scalar::Native& src, int i, int j) const
+	{
+		if (m_ppC[j])
+			dst = src * m_ppC[j]->m_pV[i];
+		else
+			dst = src;
+	}
 
 	struct InnerProduct::Calculator
 	{
@@ -142,45 +156,17 @@ namespace ECC {
 			XSet m_pX[2];
 		};
 
-		struct ModifierExpanded
-		{
-			Scalar::Native m_pPwr[2][nDim];
-			bool m_pUse[2];
-
-			void Init(const Modifier& mod)
-			{
-				for (size_t j = 0; j < _countof(mod.m_pMultiplier); j++)
-				{
-					m_pUse[j] = (NULL != mod.m_pMultiplier[j]);
-					if (m_pUse[j])
-					{
-						m_pPwr[j][0] = 1U;
-						for (uint32_t i = 1; i < nDim; i++)
-							m_pPwr[j][i] = m_pPwr[j][i - 1] * *(mod.m_pMultiplier[j]);
-					}
-				}
-			}
-
-			void Set(Scalar::Native& dst, const Scalar::Native& src, int i, int j) const
-			{
-				if (m_pUse[j])
-					dst = src * m_pPwr[j][i];
-				else
-					dst = src;
-			}
-		};
-
 		struct Aggregator
 		{
 			MultiMac& m_Mm;
 			const XSet* m_pX[2];
-			const ModifierExpanded& m_Mod;
+			const Modifier& m_Mod;
 			const Calculator* m_pCalc; // set if source are already condensed points
 			InnerProduct::BatchContext* m_pBatchCtx;
 			const int m_j;
 			const unsigned int m_iCycleTrg;
 
-			Aggregator(MultiMac& mm, const XSet* pX, const XSet* pXInv, const ModifierExpanded& mod, int j, unsigned int iCycleTrg)
+			Aggregator(MultiMac& mm, const XSet* pX, const XSet* pXInv, const Modifier& mod, int j, unsigned int iCycleTrg)
 				:m_Mm(mm)
 				,m_Mod(mod)
 				,m_pCalc(NULL)
@@ -203,7 +189,7 @@ namespace ECC {
 
 		const Scalar::Native* m_ppSrc[2];
 
-		ModifierExpanded m_Mod;
+		const Modifier& m_Mod;
 		ChallengeSet m_Cs;
 
 		MultiMac_WithBufs<(nDim >> (s_iCycle0 + 1)), nDim * 2> m_Mm;
@@ -214,6 +200,8 @@ namespace ECC {
 
 		void Condense();
 		void ExtractLR(int j);
+
+		Calculator(const Modifier& mod) :m_Mod(mod) {}
 	};
 
 	void InnerProduct::Calculator::Condense()
@@ -377,8 +365,9 @@ namespace ECC {
 	{
 		Mode::Scope scope(Mode::Fast);
 
-		Calculator c;
-		c.m_Mod.Init(mod);
+		assert(!mod.m_pAmbient); // supported only in verification mode
+
+		Calculator c(mod);
 		c.m_GenOrder = nCycles;
 		c.m_ppSrc[0] = pA;
 		c.m_ppSrc[1] = pB;
@@ -492,10 +481,12 @@ namespace ECC {
 		//
 		// sum( LR[iCycle][0] * k[iCycle]^2 + LR[iCycle][0] * k[iCycle]^-2 )
 
-		Calculator::ModifierExpanded modExp;
-		modExp.Init(mod);
-
-		Scalar::Native k;
+		Scalar::Native k, mul0;
+		if (mod.m_pAmbient)
+		{
+			mul0 = bc.m_Multiplier;
+			bc.m_Multiplier *= *mod.m_pAmbient;
+		}
 
 		// calculate pairs of cs_.m_X.m_Val
 		static_assert(!(nCycles & 1), "");
@@ -541,13 +532,13 @@ namespace ECC {
 		for (int j = 0; j < 2; j++)
 		{
 			MultiMac mmDummy;
-			Calculator::Aggregator aggr(mmDummy, &cs_.m_X, NULL, modExp, j, 0);
+			Calculator::Aggregator aggr(mmDummy, &cs_.m_X, NULL, mod, j, 0);
 			aggr.m_pBatchCtx = &bc;
 
 			k = m_pCondensed[j];
 			k = -k;
 
-			k *= bc.m_Multiplier;
+			k *= (mod.m_pAmbient && j) ? mul0 : bc.m_Multiplier;
 
 			k *= cs_.m_Mul1;
 
@@ -563,6 +554,9 @@ namespace ECC {
 		k *= cs_.m_Mul2;
 
 		bc.AddPrepared(BatchContext::s_Idx_GenDot, k);
+
+		if (mod.m_pAmbient)
+			bc.m_Multiplier = mul0; // restore it
 
 		return true;
 	}
@@ -626,13 +620,6 @@ namespace ECC {
 		void Init1(const Part1&, Oracle&);
 	};
 
-	struct RangeProof::Confidential::ChallengeSet2
-		:public ChallengeSet1
-	{
-		Scalar::Native yInv;
-		void Init1(const Part1&, Oracle&);
-	};
-
 #pragma pack (push, 1)
 	struct RangeProof::CreatorParams::Padded
 	{
@@ -690,7 +677,7 @@ namespace ECC {
 		//	return; // stop after A,S calculated
 
 		// get challenges
-		ChallengeSet2 cs;
+		ChallengeSet1 cs;
 		cs.Init1(m_Part1, oracle);
 
 		// calculate t1, t2 - parts of vec(L)*vec(R) which depend on (future) x and x^2.
@@ -864,8 +851,13 @@ namespace ECC {
 			yPwr *= cs.y;
 		}
 
+		Scalar::Native& yInv = alpha; // alias
+		yInv.SetInv(cs.y);
+
+		InnerProduct::Modifier::Channel ch1;
+		ch1.SetPwr(yInv);
 		InnerProduct::Modifier mod;
-		mod.m_pMultiplier[1] = &cs.yInv;
+		mod.m_ppC[1] = &ch1;
 
 		m_P_Tag.Create(oracle, l0, pS[0], pS[1], mod);
 
@@ -1019,12 +1011,6 @@ namespace ECC {
 		zz *= z;
 	}
 
-	void RangeProof::Confidential::ChallengeSet2::Init1(const Part1& p1, Oracle& oracle)
-	{
-		ChallengeSet1::Init1(p1, oracle);
-		yInv.SetInv(y);
-	}
-
 	void RangeProof::Confidential::ChallengeSet0::Init2(const Part2& p2, Oracle& oracle)
 	{
 		oracle << p2.m_T1 << p2.m_T2;
@@ -1048,23 +1034,26 @@ namespace ECC {
 
 		Mode::Scope scope(Mode::Fast);
 
-		ChallengeSet2 cs;
+		ChallengeSet1 cs;
 		cs.Init1(m_Part1, oracle);
 		cs.Init2(m_Part2, oracle);
+
+		InnerProduct::Modifier::Channel ch1;
+
+		// powers of cs.y in reverse order
+		ch1.m_pV[InnerProduct::nDim - 1] = 1U;
+		for (uint32_t i = InnerProduct::nDim - 1; i--; )
+			ch1.m_pV[i] = ch1.m_pV[i + 1] * cs.y;
 
 		Scalar::Native xx, zz, tDot;
 
 		// calculate delta(y,z) = (z - z^2) * sumY - z^3 * sum2
-		Scalar::Native delta, sum2, sumY;
+		Scalar::Native delta, sum2, sumY(Zero);
 
-
-		sum2 = 1U;
-		sumY = Zero;
 		for (uint32_t i = 0; i < InnerProduct::nDim; i++)
-		{
-			sumY += sum2;
-			sum2 *= cs.y;
-		}
+			sumY += ch1.m_pV[i];
+
+		const Scalar::Native& yPwrMax = ch1.m_pV[0];
 
 		sum2 = Amount(-1);
 
@@ -1112,6 +1101,9 @@ namespace ECC {
 
 		bc.EquationBegin();
 
+		delta = bc.m_Multiplier;
+		bc.m_Multiplier *= yPwrMax;
+
 		InnerProduct::Challenges cs_;
 		cs_.Init(oracle, tDot, m_P_Tag);
 
@@ -1127,35 +1119,41 @@ namespace ECC {
 		if (!bc.AddCasual(m_Part1.m_S, cs.x * cs_.m_Mul2))
 			return false;
 
-		Scalar::Native pwr, mul;
-
-		mul = 2U;
-		mul *= cs.yInv;
-		pwr = zz;
-		pwr *= cs_.m_Mul2;
-		pwr *= bc.m_Multiplier;
+		if (!bc.AddCasual(m_Part1.m_A, cs_.m_Mul2))
+			return false;
 
 		Scalar::Native& zMul = sumY; // alias
 		zMul = cs.z * bc.m_Multiplier;
 
-		for (uint32_t i = 0; ; )
+		bc.m_Multiplier = delta; // restore multiplier before it was multiplied by yPwrMax
+
+		Scalar::Native& pwr = delta; // alias
+		Scalar::Native mul;
+
+		mul = Context::get().m_Ipp.m_2Inv;
+		mul *= cs.y; // y/2
+		pwr = zz;
+		pwr *= (Amount(1) << (InnerProduct::nDim - 1)); // 2 ^ (nDim-1)
+		pwr *= cs_.m_Mul2;
+		pwr *= bc.m_Multiplier;
+
+		for (uint32_t i = InnerProduct::nDim - 1; ; )
 		{
 			sum2 = pwr;
 			sum2 += zMul;
 
 			bc.AddPreparedM(InnerProduct::nDim + i, sum2);
 
-			if (InnerProduct::nDim == ++i)
+			if (!i--)
 				break;
 
 			pwr *= mul;
 		}
 
-		bc.AddCasual(m_Part1.m_A, cs_.m_Mul2);
-
 		// finally check the inner product
 		InnerProduct::Modifier mod;
-		mod.m_pMultiplier[1] = &cs.yInv;
+		mod.m_ppC[1] = &ch1;
+		mod.m_pAmbient = &yPwrMax;
 
 		return m_P_Tag.IsValid(bc, cs_, tDot, mod);
 	}

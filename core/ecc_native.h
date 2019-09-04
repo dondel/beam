@@ -635,6 +635,9 @@ namespace ECC
 			MultiMac::Prepared H_;
 			MultiMac::Prepared J_;
 
+			// useful constants
+			Scalar::Native m_2Inv;
+
 		} m_Ipp;
 
 		struct Casual
@@ -719,6 +722,12 @@ namespace ECC
 			m_pCasual = (MultiMac::Casual*) m_pBuf;
 			m_pKCasual = (Scalar::Native*) m_pBuf2;
 		}
+	};
+
+	struct InnerProduct::Modifier::Channel
+	{
+		Scalar::Native m_pV[nDim];
+		void SetPwr(const Scalar::Native& x); // m_pV[i] = x ^ i
 	};
 
 	class Commitment
